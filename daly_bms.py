@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from dalybms import DalyBMS as _DalyBMSLib
+from dalybms import DalyBMSSinowealth as _DalyBMSSinowealth
 
 logger = logging.getLogger(__name__)
 
@@ -210,7 +211,8 @@ class DalyBMS:
     """
     Adapter around the ``dalybms`` library for use with the Prometheus exporter.
 
-    All serial communication is delegated to :class:`dalybms.DalyBMS`.
+    All serial communication is delegated to :class:`dalybms.DalyBMS` or, when
+    *sinowealth* is ``True``, to :class:`dalybms.DalyBMSSinowealth`.
     This class translates the library's response dictionaries into the typed
     dataclasses consumed by :mod:`exporter`.
 
@@ -220,6 +222,7 @@ class DalyBMS:
     UART / Bluetooth.  This adapter accepts the legacy hex-style address
     ``0x40`` (64) and ``0x80`` (128) as well and converts them automatically:
     any ``address >= 16`` is right-shifted by 4 bits (e.g. ``0x40 → 4``).
+    This parameter is ignored in Sinowealth mode.
 
     Data-fetch toggles
     ------------------
@@ -239,6 +242,7 @@ class DalyBMS:
         baud_rate: int = 9600,
         address: int = 0x40,
         timeout: float = 1.0,
+        sinowealth: bool = False,
         fetch_soc: bool = True,
         fetch_cell_voltage_range: bool = True,
         fetch_temperature_range: bool = True,
@@ -252,18 +256,23 @@ class DalyBMS:
         temp_sensor_count_override: int = 0,
     ) -> None:
         self.port = port
-        # Convert legacy hex-style address (e.g. 0x40) to dalybms convention.
-        # dalybms: 4 = RS-485, 8 = UART/Bluetooth.
-        lib_address = address >> 4 if address >= 16 else address
-        if lib_address not in (4, 8):
-            logger.warning(
-                "Unexpected BMS address %r (resolved to lib address %d); "
-                "defaulting to RS-485 (lib address=4).",
-                address,
-                lib_address,
-            )
-            lib_address = 4
-        self._lib = _DalyBMSLib(address=lib_address, logger=logger)
+        self._sinowealth = sinowealth
+
+        if sinowealth:
+            self._lib = _DalyBMSSinowealth(logger=logger)
+        else:
+            # Convert legacy hex-style address (e.g. 0x40) to dalybms convention.
+            # dalybms: 4 = RS-485, 8 = UART/Bluetooth.
+            lib_address = address >> 4 if address >= 16 else address
+            if lib_address not in (4, 8):
+                logger.warning(
+                    "Unexpected BMS address %r (resolved to lib address %d); "
+                    "defaulting to RS-485 (lib address=4).",
+                    address,
+                    lib_address,
+                )
+                lib_address = 4
+            self._lib = _DalyBMSLib(address=lib_address, logger=logger)
 
         self._fetch_soc              = fetch_soc
         self._fetch_cell_voltage_range = fetch_cell_voltage_range
@@ -366,13 +375,25 @@ class DalyBMS:
             try:
                 mos = self._lib.get_mosfet_status()
                 if mos:
-                    data.mos = MosStatus(
-                        charge_mos_on=bool(mos["charging_mosfet"]),
-                        discharge_mos_on=bool(mos["discharging_mosfet"]),
-                        # bms_heartbeat not provided by the dalybms library
-                        bms_heartbeat=0,
-                        remaining_capacity_ah=mos["capacity_ah"],
-                    )
+                    if self._sinowealth:
+                        # Sinowealth returns remaining_capacity_ah and pack_state list;
+                        # infer MOS states from pack_state flags.
+                        pack_state = mos.get("pack_state", [])
+                        data.mos = MosStatus(
+                            charge_mos_on="CHGMOS: Charging enabled" in pack_state,
+                            discharge_mos_on="DSGMOS: Discharging enabled" in pack_state,
+                            # bms_heartbeat not available on Sinowealth
+                            bms_heartbeat=0,
+                            remaining_capacity_ah=mos.get("remaining_capacity_ah", 0.0),
+                        )
+                    else:
+                        data.mos = MosStatus(
+                            charge_mos_on=bool(mos["charging_mosfet"]),
+                            discharge_mos_on=bool(mos["discharging_mosfet"]),
+                            # bms_heartbeat not provided by the dalybms library
+                            bms_heartbeat=0,
+                            remaining_capacity_ah=mos["capacity_ah"],
+                        )
             except Exception as exc:
                 logger.warning("Failed to read MOSFET status: %s", exc)
 
@@ -381,15 +402,27 @@ class DalyBMS:
             try:
                 st = self._lib.get_status()
                 if st:
-                    data.status = StatusInfo(
-                        cell_count=st["cells"],
-                        temperature_sensor_count=st["temperature_sensors"],
-                        charger_connected=bool(st["charger_running"]),
-                        load_connected=bool(st["load_running"]),
-                        # raw state bits not provided by the dalybms library
-                        states=0,
-                        cycles=st["cycles"],
-                    )
+                    if self._sinowealth:
+                        # Sinowealth only provides cycles; cell/sensor counts will be
+                        # back-filled after get_cell_voltages and get_temperatures run.
+                        data.status = StatusInfo(
+                            cell_count=0,
+                            temperature_sensor_count=0,
+                            charger_connected=False,
+                            load_connected=False,
+                            states=0,
+                            cycles=st.get("cycles", 0),
+                        )
+                    else:
+                        data.status = StatusInfo(
+                            cell_count=st["cells"],
+                            temperature_sensor_count=st["temperature_sensors"],
+                            charger_connected=bool(st["charger_running"]),
+                            load_connected=bool(st["load_running"]),
+                            # raw state bits not provided by the dalybms library
+                            states=0,
+                            cycles=st["cycles"],
+                        )
             except Exception as exc:
                 logger.warning("Failed to read BMS status: %s", exc)
         elif self._cell_count_override > 0 or self._temp_sensor_count_override > 0:
@@ -404,7 +437,8 @@ class DalyBMS:
         # get_status()) to calculate how many response frames to expect for
         # cell voltages and temperatures.  When FETCH_STATUS is False we prime
         # that dict with the override counts so those commands keep working.
-        if not self._fetch_status and data.status:
+        # Sinowealth does not use this mechanism.
+        if not self._sinowealth and not self._fetch_status and data.status:
             if self._lib.status is None:
                 self._lib.status = {}
             self._lib.status["cells"] = data.status.cell_count
@@ -424,9 +458,17 @@ class DalyBMS:
             try:
                 temps = self._lib.get_temperatures()
                 if temps:
+                    # Both regular and Sinowealth return a dict; values are sorted
+                    # by key (numbered for regular, named "external1"/"external2"
+                    # for Sinowealth) — sorted() works correctly for both.
                     data.temperatures = [temps[k] for k in sorted(temps.keys())]
             except Exception as exc:
                 logger.warning("Failed to read temperatures: %s", exc)
+
+        # Back-fill Sinowealth status cell/sensor counts from actual data.
+        if self._sinowealth and data.status is not None:
+            data.status.cell_count = len(data.cell_voltages)
+            data.status.temperature_sensor_count = len(data.temperatures)
 
         # -- Cell balancing status -------------------------------------------
         if self._fetch_balancing:
@@ -443,14 +485,21 @@ class DalyBMS:
                 logger.warning("Failed to read balancing status: %s", exc)
 
         # -- Failure / alarm flags -------------------------------------------
-        # NOTE: _read_request is a private dalybms method; it returns the
-        # raw 8-byte payload that get_errors() would receive.  We parse it
-        # directly to populate the structured FailureFlags dataclass.
         if self._fetch_errors:
             try:
-                raw_errors = self._lib._read_request("98")
-                if raw_errors is not False and raw_errors:
-                    data.failures = _parse_failure_flags(raw_errors)
+                if self._sinowealth:
+                    # Sinowealth returns a list of human-readable error strings;
+                    # FailureFlags bit-fields are not applicable.
+                    errors = self._lib.get_errors()
+                    if errors:
+                        logger.warning("BMS errors reported: %s", ", ".join(errors))
+                else:
+                    # NOTE: _read_request is a private dalybms method; it returns the
+                    # raw 8-byte payload that get_errors() would receive.  We parse it
+                    # directly to populate the structured FailureFlags dataclass.
+                    raw_errors = self._lib._read_request("98")
+                    if raw_errors is not False and raw_errors:
+                        data.failures = _parse_failure_flags(raw_errors)
             except Exception as exc:
                 logger.warning("Failed to read failure flags: %s", exc)
 

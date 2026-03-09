@@ -42,6 +42,15 @@ SERIAL_PORT: str = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
 # This changes the dalybms library address from 4 (RS-485) to 8 (UART/Bluetooth).
 BMS_UART: bool = _bool("BMS_UART", False)
 
+# Set to "true" to enable DEBUG-level logging from the dalybms library.
+# Verbose output shows the raw serial frames for every command sent/received
+# and is useful for diagnosing communication problems.
+BMS_VERBOSE: bool = _bool("BMS_VERBOSE", False)
+
+# Set to "true" when the BMS uses a Sinowealth chip instead of the standard
+# Daly chip.  This selects the dalybms.DalyBMSSinowealth driver class.
+BMS_SINOWEALTH: bool = _bool("BMS_SINOWEALTH", False)
+
 # ---------------------------------------------------------------------------
 # Daly BMS device settings
 # ---------------------------------------------------------------------------
@@ -103,6 +112,12 @@ METRICS_PATH: str = os.environ.get("METRICS_PATH", "/metrics")
 
 # How often (in seconds) the BMS is polled for fresh data.
 POLL_INTERVAL: float = float(os.environ.get("POLL_INTERVAL", "10.0"))
+
+# Maximum seconds a single poll cycle may run before it is considered hung.
+# When exceeded the serial port is closed to interrupt the blocked read, a
+# warning is logged, and the next poll starts at the normal interval.
+# Defaults to POLL_INTERVAL so a hung poll never overlaps the next one.
+POLL_TIMEOUT: float = float(os.environ.get("POLL_TIMEOUT", str(POLL_INTERVAL)))
 
 # Number of consecutive communication errors before the exporter marks the BMS
 # as unreachable (daly_bms_up == 0) and logs a warning.

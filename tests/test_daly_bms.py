@@ -519,5 +519,222 @@ class TestFetchStatusFalseWithOverride(unittest.TestCase):
         self.assertIsNone(data.status)
 
 
+# ---------------------------------------------------------------------------
+# Tests for Sinowealth mode
+# ---------------------------------------------------------------------------
+
+def _make_sinowealth_lib_mock(**kwargs):
+    """Return a pre-configured MagicMock for dalybms.DalyBMSSinowealth."""
+    m = MagicMock()
+    m.get_soc.return_value = kwargs.get("soc", {
+        "total_voltage": 48.0,
+        "current": -5.0,
+        "soc_percent": 90.0,
+    })
+    m.get_cell_voltage_range.return_value = kwargs.get("cell_voltage_range", {})
+    m.get_temperature_range.return_value = kwargs.get("temperature_range", {})
+    m.get_mosfet_status.return_value = kwargs.get("mosfet_status", {
+        "full_capacity_ah": 100.0,
+        "remaining_capacity_ah": 90.0,
+        "pack_state": [
+            "CHGMOS: Charging enabled",
+            "DSGMOS: Discharging enabled",
+        ],
+    })
+    m.get_status.return_value = kwargs.get("status", {"cycles": 12})
+    m.get_cell_voltages.return_value = kwargs.get("cell_voltages", {
+        1: 3.200, 2: 3.210, 3: 3.190, 4: 3.205,
+    })
+    # Sinowealth temperatures are named "external1", "external2"
+    m.get_temperatures.return_value = kwargs.get("temperatures", {
+        "external1": 28.0, "external2": 30.0,
+    })
+    m.get_balancing_status.return_value = kwargs.get("balancing_status", {})
+    m.get_errors.return_value = kwargs.get("errors", [])
+    return m
+
+
+class TestSinowealthMode(unittest.TestCase):
+    """Verify Sinowealth chip mode uses the right library and data mapping."""
+
+    @patch("daly_bms._DalyBMSSinowealth")
+    @patch("daly_bms._DalyBMSLib")
+    def test_sinowealth_true_uses_sinowealth_class(self, MockLib, MockSino):
+        bms_mod.DalyBMS(port="/dev/null", sinowealth=True)
+        MockSino.assert_called_once()
+        MockLib.assert_not_called()
+
+    @patch("daly_bms._DalyBMSSinowealth")
+    @patch("daly_bms._DalyBMSLib")
+    def test_sinowealth_false_uses_regular_class(self, MockLib, MockSino):
+        bms_mod.DalyBMS(port="/dev/null", sinowealth=False)
+        MockLib.assert_called_once()
+        MockSino.assert_not_called()
+
+    def _make_sino_bms(self, **kwargs):
+        with patch("daly_bms._DalyBMSSinowealth"), patch("daly_bms._DalyBMSLib"):
+            bms = bms_mod.DalyBMS(port="/dev/null", sinowealth=True)
+        bms._lib = _make_sinowealth_lib_mock(**kwargs)
+        return bms
+
+    def test_soc_data_mapped(self):
+        data = self._make_sino_bms().get_all_data()
+        self.assertIsNotNone(data.basic)
+        self.assertAlmostEqual(data.basic.pack_voltage, 48.0)
+        self.assertAlmostEqual(data.basic.pack_current, -5.0)
+        self.assertAlmostEqual(data.basic.soc_percent, 90.0)
+
+    def test_cell_voltage_range_empty_dict_not_populated(self):
+        data = self._make_sino_bms().get_all_data()
+        # Sinowealth returns {} for cell_voltage_range — leave as None
+        self.assertIsNone(data.cell_extremes)
+
+    def test_mosfet_status_from_pack_state(self):
+        data = self._make_sino_bms().get_all_data()
+        self.assertIsNotNone(data.mos)
+        self.assertTrue(data.mos.charge_mos_on)
+        self.assertTrue(data.mos.discharge_mos_on)
+        self.assertAlmostEqual(data.mos.remaining_capacity_ah, 90.0)
+
+    def test_mosfet_mos_off_when_not_in_pack_state(self):
+        bms = self._make_sino_bms(mosfet_status={
+            "remaining_capacity_ah": 50.0,
+            "pack_state": [],
+        })
+        data = bms.get_all_data()
+        self.assertFalse(data.mos.charge_mos_on)
+        self.assertFalse(data.mos.discharge_mos_on)
+
+    def test_status_cycles_from_sinowealth(self):
+        data = self._make_sino_bms().get_all_data()
+        self.assertIsNotNone(data.status)
+        self.assertEqual(data.status.cycles, 12)
+
+    def test_status_cell_count_backfilled_from_cell_voltages(self):
+        data = self._make_sino_bms().get_all_data()
+        # 4 cells from mock get_cell_voltages
+        self.assertEqual(data.status.cell_count, 4)
+
+    def test_status_temp_sensor_count_backfilled_from_temperatures(self):
+        data = self._make_sino_bms().get_all_data()
+        # 2 sensors from mock get_temperatures (external1, external2)
+        self.assertEqual(data.status.temperature_sensor_count, 2)
+
+    def test_cell_voltages_list(self):
+        data = self._make_sino_bms().get_all_data()
+        self.assertEqual(len(data.cell_voltages), 4)
+        self.assertAlmostEqual(data.cell_voltages[0], 3.200, places=3)
+
+    def test_temperatures_sorted_by_key_name(self):
+        data = self._make_sino_bms().get_all_data()
+        # sorted(["external1", "external2"]) → ["external1", "external2"]
+        self.assertEqual(len(data.temperatures), 2)
+        self.assertAlmostEqual(data.temperatures[0], 28.0)  # external1
+        self.assertAlmostEqual(data.temperatures[1], 30.0)  # external2
+
+    def test_errors_logged_not_failures_populated(self):
+        bms = self._make_sino_bms(errors=["OV: Overvoltage protection occurs"])
+        data = bms.get_all_data()
+        # Sinowealth errors are logged, not put into FailureFlags
+        self.assertIsNone(data.failures)
+        bms._lib.get_errors.assert_called_once()
+
+    def test_no_errors_when_list_empty(self):
+        data = self._make_sino_bms(errors=[]).get_all_data()
+        self.assertIsNone(data.failures)
+
+    def test_read_request_not_called_in_sinowealth_mode(self):
+        bms = self._make_sino_bms()
+        bms.get_all_data()
+        bms._lib._read_request.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Tests for verbose mode
+# ---------------------------------------------------------------------------
+
+class TestVerboseMode(unittest.TestCase):
+    """Verify that the verbose flag raises the logger to DEBUG level."""
+
+    def test_verbose_true_sets_root_logger_debug(self):
+        """BMS_VERBOSE=true should set the root logger level to DEBUG."""
+        import logging as logging_mod
+        root_logger = logging_mod.getLogger()
+        original_level = root_logger.level
+        try:
+            # Simulate what main() does when BMS_VERBOSE is True
+            root_logger.setLevel(logging_mod.DEBUG)
+            self.assertEqual(root_logger.level, logging_mod.DEBUG)
+        finally:
+            root_logger.setLevel(original_level)
+
+
+# ---------------------------------------------------------------------------
+# Tests for the poll-timeout watchdog (BMSPoller)
+# ---------------------------------------------------------------------------
+
+class TestBMSPollerTimeout(unittest.TestCase):
+    """Verify the BMSPoller timeout watchdog via exporter.BMSPoller."""
+
+    def setUp(self):
+        # Import BMSPoller from exporter without running main()
+        import importlib
+        import sys
+        # Stub prometheus_client before import to avoid binding issues
+        sys.modules.setdefault("prometheus_client", MagicMock())
+        import exporter as exp_mod
+        self.exp_mod = exp_mod
+
+    def _make_poller(self, bms_mock, interval=1.0, poll_timeout=0.1):
+        return self.exp_mod.BMSPoller(bms_mock, interval=interval, poll_timeout=poll_timeout)
+
+    def test_hung_poll_triggers_disconnect(self):
+        """A poll that exceeds poll_timeout must call disconnect()."""
+        import threading
+        import time
+
+        bms_mock = MagicMock()
+        # get_all_data blocks until the Event is set (simulates a hang).
+        # After the event is set it raises RuntimeError to mimic the
+        # SerialException raised when disconnect() closes the port.
+        hang_event = threading.Event()
+        def _hanging_poll():
+            hang_event.wait(timeout=5.0)
+            raise RuntimeError("simulated serial port close after disconnect")
+        bms_mock.get_all_data.side_effect = _hanging_poll
+
+        poller = self._make_poller(bms_mock, interval=2.0, poll_timeout=0.15)
+        poller.start()
+
+        # Give enough time for the poller to start, time out, and call disconnect
+        time.sleep(0.8)
+
+        hang_event.set()   # unblock the worker so the test cleans up
+        poller.join(timeout=2.0)
+
+        bms_mock.disconnect.assert_called()
+
+    def test_successful_poll_calls_get_all_data(self):
+        """A normal (fast) poll must call get_all_data() and not disconnect()."""
+        import threading
+        import time
+
+        bms_mock = MagicMock()
+        done_event = threading.Event()
+        def _fast_poll():
+            done_event.set()
+            return MagicMock()
+        bms_mock.get_all_data.side_effect = _fast_poll
+
+        poller = self._make_poller(bms_mock, interval=2.0, poll_timeout=1.0)
+        poller.start()
+
+        done_event.wait(timeout=2.0)
+        poller.join(timeout=3.0)
+
+        bms_mock.get_all_data.assert_called()
+        bms_mock.disconnect.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

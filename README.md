@@ -6,7 +6,7 @@ A Python application that reads data from a **Daly BMS** (Battery Management Sys
 
 ## Features
 
-- Reads all standard Daly BMS data frames (commands `0x90` – `0x98`):
+- Reads all standard Daly BMS data frames (using dalybms python lib):
   - Pack voltage, acquisition voltage, current, and State of Charge (SOC)
   - Min/max individual cell voltages and their cell numbers
   - Min/max temperature sensor readings
@@ -18,8 +18,7 @@ A Python application that reads data from a **Daly BMS** (Battery Management Sys
   - Full alarm and fault flag decode (34 named bits)
 - Serves all metrics at a configurable Prometheus `/metrics` endpoint
 - Configurable via a `.env` file or environment variables (no code changes needed)
-- Graceful handling of transient communication errors with `daly_bms_up` availability metric
-- Supports multiple BMS instances via `BMS_INSTANCE` label
+- Supports multiple BMS instances via `BMS_INSTANCE` label (untested)
 
 ---
 
@@ -236,6 +235,29 @@ power is required on the RS-485 bus; the BMS supplies it.
 
 ---
 
+## Disclaimer
+This script is tested with a Raspberry Pi 2 B+ and a CH340 USB RS485 Converter connected to a DALY SMART BMS.
+I had to configure my .env to use verbose Workaround, because otherwise the --status fetch does not work properly.
+
+There is absolutely NO WARRANTY for any damages made to any component of your Setup.
+This script is mainly built by using Copilot. It's reviewed to the best of my knowledge but could possibly may harm your battery, BMS or other components connected to the same RS485 bus, if misused or malfunctioning. Please use carefully and double check your configuration and setup. It's your responsibility!
+
+### Some things weren't tested yet:
+
+#### UART: ❌ Not Tested
+#### Sinowealth Chip: ❌ Not Tested
+#### Multiple Instances on One Device/Bus: ❌ Not Tested
+#### DALY non "SMART" BMS: ❌ Not Tested
+
+Please feel free to contribute experiences from your setup.
+
+---
+
 ## License
 
-MIT
+Free for personal and non-commercial use.
+
+You may use, modify, and distribute the software.
+
+Commercial use requires a license from the author.
+

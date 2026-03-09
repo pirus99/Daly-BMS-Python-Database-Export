@@ -42,10 +42,22 @@ SERIAL_PORT: str = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
 # This changes the dalybms library address from 4 (RS-485) to 8 (UART/Bluetooth).
 BMS_UART: bool = _bool("BMS_UART", False)
 
-# Set to "true" to enable DEBUG-level logging from the dalybms library.
-# Verbose output shows the raw serial frames for every command sent/received
-# and is useful for diagnosing communication problems.
+# Set to "true" to enable verbose (DEBUG) mode in the dalybms library.
+# This is a workaround for BMS firmware versions where the status command does
+# not respond correctly at normal timing: the dalybms library's internal
+# logger.debug() calls add small delays between serial operations that make
+# the firmware respond reliably.
+# Note: this flag does NOT control whether debug output appears in the log —
+# use BMS_DEBUG_LOG for that.  With BMS_VERBOSE=true and BMS_DEBUG_LOG=false
+# the timing workaround is active but the verbose frames are silently discarded.
 BMS_VERBOSE: bool = _bool("BMS_VERBOSE", False)
+
+# Set to "true" to show DEBUG-level output in the console / log files.
+# When false (default) only INFO and above messages are printed, preventing
+# log spam from the dalybms library's verbose frame output.
+# Set both BMS_VERBOSE=true and BMS_DEBUG_LOG=true to see the raw serial frames
+# sent/received by the dalybms library.
+BMS_DEBUG_LOG: bool = _bool("BMS_DEBUG_LOG", False)
 
 # Set to "true" when the BMS uses a Sinowealth chip instead of the standard
 # Daly chip.  This selects the dalybms.DalyBMSSinowealth driver class.

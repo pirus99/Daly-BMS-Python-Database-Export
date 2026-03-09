@@ -27,17 +27,27 @@ from prometheus_client import (
 )
 
 import config
-from daly_bms import DalyBMS, DalyBMSData, DalyBMSError
+from daly_bms import DalyBMS, DalyBMSData, DalyBMSError, _LIB_LOGGER_NAME
 
 # ---------------------------------------------------------------------------
 # Logging
+#
+# Root logger is set to DEBUG so that child loggers (notably the dalybms
+# library when BMS_VERBOSE is on) can generate records.  Output is gated by
+# the *handler* level:
+#   - default : INFO  (prevents debug-frame spam in production)
+#   - BMS_DEBUG_LOG=true → lowered to DEBUG in main() so debug output appears
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
+# Default gate: only INFO+ printed until BMS_DEBUG_LOG lowers it.
+for _h in logging.getLogger().handlers:
+    if _h.level == logging.NOTSET:
+        _h.setLevel(logging.INFO)
 logger = logging.getLogger("daly_bms_exporter")
 
 
@@ -455,10 +465,12 @@ class MetricsHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # Enable verbose (DEBUG) logging before anything else so library messages
-    # from the very first connect() call are also captured.
-    if config.BMS_VERBOSE:
-        logging.getLogger().setLevel(logging.DEBUG)
+    # BMS_DEBUG_LOG: lower the root handler level to DEBUG so debug output
+    # (including dalybms verbose frames when BMS_VERBOSE is also true) appears
+    # in the console / logfiles.  Without this flag only INFO+ is printed.
+    if config.BMS_DEBUG_LOG:
+        for h in logging.getLogger().handlers:
+            h.setLevel(logging.DEBUG)
 
     logger.info("=== Daly BMS Prometheus Exporter ===")
     logger.info("Model      : %s", config.BMS_MODEL)
@@ -470,13 +482,23 @@ def main() -> None:
         ", Sinowealth" if config.BMS_SINOWEALTH else "",
     )
     logger.info("Poll       : %.1f s (timeout: %.1f s)", config.POLL_INTERVAL, config.POLL_TIMEOUT)
-    logger.info("Verbose    : %s", "on" if config.BMS_VERBOSE else "off")
+    logger.info(
+        "BMS_VERBOSE: %s  BMS_DEBUG_LOG: %s",
+        "on" if config.BMS_VERBOSE else "off",
+        "on" if config.BMS_DEBUG_LOG else "off",
+    )
     logger.info(
         "Metrics    : http://%s:%d%s",
         config.WEB_SERVER_ADDRESS,
         config.WEB_SERVER_PORT,
         config.METRICS_PATH,
     )
+
+    if config.BMS_VERBOSE and not config.BMS_DEBUG_LOG:
+        logger.info(
+            "BMS_VERBOSE is on (--status timing workaround active); "
+            "set BMS_DEBUG_LOG=true to see the raw serial frames."
+        )
 
     # Log which data categories are enabled / disabled.
     fetch_map = {
@@ -500,6 +522,7 @@ def main() -> None:
         port=config.SERIAL_PORT,
         address=bms_address,
         sinowealth=config.BMS_SINOWEALTH,
+        verbose=config.BMS_VERBOSE,
         fetch_soc=config.FETCH_SOC,
         fetch_cell_voltage_range=config.FETCH_CELL_VOLTAGE_RANGE,
         fetch_temperature_range=config.FETCH_TEMPERATURE_RANGE,

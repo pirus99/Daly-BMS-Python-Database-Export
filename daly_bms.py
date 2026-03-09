@@ -18,6 +18,13 @@ from dalybms import DalyBMS as _DalyBMSLib
 from dalybms import DalyBMSSinowealth as _DalyBMSSinowealth
 
 logger = logging.getLogger(__name__)
+# Explicitly keep module logger at INFO so that dalybms debug calls do not
+# execute when verbose mode is off (even if the root logger is at DEBUG).
+logger.setLevel(logging.INFO)
+
+# Name of the dedicated DEBUG-level logger used in verbose mode.
+# exporter.py reads this constant to enable propagation when BMS_DEBUG_LOG=true.
+_LIB_LOGGER_NAME: str = __name__ + ".lib"
 
 
 # ---------------------------------------------------------------------------
@@ -224,6 +231,18 @@ class DalyBMS:
     any ``address >= 16`` is right-shifted by 4 bits (e.g. ``0x40 → 4``).
     This parameter is ignored in Sinowealth mode.
 
+    Verbose / BMS_VERBOSE workaround
+    ---------------------------------
+    When *verbose* is ``True`` the dalybms library receives a dedicated
+    ``logging.DEBUG``-level logger (named :data:`_LIB_LOGGER_NAME`).  This
+    makes the library's internal ``logger.debug()`` calls execute, adding the
+    small serial-timing delays that allow ``--status`` to work correctly on
+    BMS firmware that otherwise times out.
+    Whether those DEBUG messages are visible in the console is controlled
+    separately by the application's root-handler level (``BMS_DEBUG_LOG`` in
+    ``exporter.py``), so the timing workaround can be active without
+    spamming the log.
+
     Data-fetch toggles
     ------------------
     Some BMS firmware versions do not respond correctly to every command.
@@ -243,6 +262,7 @@ class DalyBMS:
         address: int = 0x40,
         timeout: float = 1.0,
         sinowealth: bool = False,
+        verbose: bool = False,
         fetch_soc: bool = True,
         fetch_cell_voltage_range: bool = True,
         fetch_temperature_range: bool = True,
@@ -258,8 +278,22 @@ class DalyBMS:
         self.port = port
         self._sinowealth = sinowealth
 
+        # Select the logger passed to the dalybms library.
+        # When verbose=True a dedicated DEBUG-level logger is used so the
+        # library's debug() calls execute (timing workaround for --status).
+        # Propagation to the root logger is left enabled; the root *handler*
+        # level (controlled by BMS_DEBUG_LOG) decides whether the output
+        # actually appears in the console.
+        if verbose:
+            lib_logger = logging.getLogger(_LIB_LOGGER_NAME)
+            lib_logger.setLevel(logging.DEBUG)
+            if not lib_logger.handlers:
+                lib_logger.addHandler(logging.NullHandler())
+        else:
+            lib_logger = logger  # INFO level; debug calls short-circuit
+
         if sinowealth:
-            self._lib = _DalyBMSSinowealth(logger=logger)
+            self._lib = _DalyBMSSinowealth(logger=lib_logger)
         else:
             # Convert legacy hex-style address (e.g. 0x40) to dalybms convention.
             # dalybms: 4 = RS-485, 8 = UART/Bluetooth.
@@ -272,7 +306,7 @@ class DalyBMS:
                     lib_address,
                 )
                 lib_address = 4
-            self._lib = _DalyBMSLib(address=lib_address, logger=logger)
+            self._lib = _DalyBMSLib(address=lib_address, logger=lib_logger)
 
         self._fetch_soc              = fetch_soc
         self._fetch_cell_voltage_range = fetch_cell_voltage_range

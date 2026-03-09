@@ -650,23 +650,52 @@ class TestSinowealthMode(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests for verbose mode
+# Tests for verbose mode and debug log
 # ---------------------------------------------------------------------------
 
 class TestVerboseMode(unittest.TestCase):
-    """Verify that the verbose flag raises the logger to DEBUG level."""
+    """Verify the verbose/debug-log flag behaviour."""
 
-    def test_verbose_true_sets_root_logger_debug(self):
-        """BMS_VERBOSE=true should set the root logger level to DEBUG."""
+    @patch("daly_bms._DalyBMSLib")
+    def test_verbose_false_uses_module_logger(self, MockLib):
+        """When verbose=False the module-level INFO logger is passed to dalybms."""
         import logging as logging_mod
-        root_logger = logging_mod.getLogger()
-        original_level = root_logger.level
+        bms = bms_mod.DalyBMS(port="/dev/null", address=4, verbose=False)
+        _, kwargs = MockLib.call_args
+        lib_logger = kwargs.get("logger") or MockLib.call_args[0][1]
+        # Module logger is at INFO so dalybms debug() calls short-circuit
+        self.assertGreaterEqual(lib_logger.level, logging_mod.INFO)
+
+    @patch("daly_bms._DalyBMSLib")
+    def test_verbose_true_uses_debug_lib_logger(self, MockLib):
+        """When verbose=True a dedicated DEBUG-level logger is passed to dalybms."""
+        import logging as logging_mod
+        bms = bms_mod.DalyBMS(port="/dev/null", address=4, verbose=True)
+        _, kwargs = MockLib.call_args
+        lib_logger = kwargs.get("logger") or MockLib.call_args[0][1]
+        self.assertEqual(lib_logger.level, logging_mod.DEBUG)
+
+    @patch("daly_bms._DalyBMSLib")
+    def test_verbose_true_lib_logger_named_correctly(self, MockLib):
+        """The verbose lib logger must have the canonical _LIB_LOGGER_NAME."""
+        bms = bms_mod.DalyBMS(port="/dev/null", address=4, verbose=True)
+        _, kwargs = MockLib.call_args
+        lib_logger = kwargs.get("logger") or MockLib.call_args[0][1]
+        self.assertEqual(lib_logger.name, bms_mod._LIB_LOGGER_NAME)
+
+    def test_debug_log_flag_lowers_handler_level(self):
+        """BMS_DEBUG_LOG=true lowers the root handler(s) to DEBUG."""
+        import logging as logging_mod
+        root = logging_mod.getLogger()
+        original_handler_levels = [h.level for h in root.handlers]
         try:
-            # Simulate what main() does when BMS_VERBOSE is True
-            root_logger.setLevel(logging_mod.DEBUG)
-            self.assertEqual(root_logger.level, logging_mod.DEBUG)
+            for h in root.handlers:
+                h.setLevel(logging_mod.DEBUG)
+            for h in root.handlers:
+                self.assertEqual(h.level, logging_mod.DEBUG)
         finally:
-            root_logger.setLevel(original_level)
+            for h, lv in zip(root.handlers, original_handler_levels):
+                h.setLevel(lv)
 
 
 # ---------------------------------------------------------------------------

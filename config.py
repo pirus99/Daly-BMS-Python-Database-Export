@@ -24,32 +24,19 @@ except ImportError:
 # Serial / RS-485 interface settings
 # ---------------------------------------------------------------------------
 
-# Path to the USB-to-RS485 serial device.
+# Path to the USB-to-RS485 (or UART) serial device.
 # Examples: /dev/ttyUSB0  (Linux)
 #           /dev/tty.usbserial-XXXX  (macOS)
 #           COM3  (Windows)
 SERIAL_PORT: str = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
 
-# Baud rate for the RS-485 link.  Daly BMS units use 9600 baud by default.
-BAUD_RATE: int = int(os.environ.get("BAUD_RATE", "9600"))
-
-# Serial read timeout in seconds.
-SERIAL_TIMEOUT: float = float(os.environ.get("SERIAL_TIMEOUT", "1.0"))
-
+# Set to "true" to communicate via UART instead of RS-485.
+# This changes the dalybms library address from 4 (RS-485) to 8 (UART/Bluetooth).
+BMS_UART: bool = os.environ.get("BMS_UART", "false").lower() in ("1", "true", "yes")
 
 # ---------------------------------------------------------------------------
 # Daly BMS device settings
 # ---------------------------------------------------------------------------
-
-# RS-485 device address of the BMS.
-# The factory default is 0x40 (decimal 64).
-# Accepts a hex string (e.g. "0x40") or a decimal string (e.g. "64").
-_bms_addr_raw: str = os.environ.get("BMS_ADDRESS", "0x40")
-BMS_ADDRESS: int = (
-    int(_bms_addr_raw, 16)
-    if _bms_addr_raw.startswith("0x") or _bms_addr_raw.startswith("0X")
-    else int(_bms_addr_raw)
-)
 
 # Human-readable model name — used as a Prometheus label so you can tell
 # multiple BMS units apart in Grafana.

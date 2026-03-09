@@ -58,7 +58,7 @@ bms_info.info(
         "model": config.BMS_MODEL,
         "instance": config.BMS_INSTANCE,
         "serial_port": config.SERIAL_PORT,
-        "bms_address": hex(config.BMS_ADDRESS),
+        "connection_mode": "uart" if config.BMS_UART else "rs485",
     }
 )
 
@@ -410,8 +410,7 @@ def main() -> None:
     logger.info("=== Daly BMS Prometheus Exporter ===")
     logger.info("Model    : %s", config.BMS_MODEL)
     logger.info("Instance : %s", config.BMS_INSTANCE)
-    logger.info("Port     : %s @ %d baud", config.SERIAL_PORT, config.BAUD_RATE)
-    logger.info("BMS addr : 0x%02X", config.BMS_ADDRESS)
+    logger.info("Port     : %s (%s)", config.SERIAL_PORT, "UART" if config.BMS_UART else "RS-485")
     logger.info("Poll     : %.1f s", config.POLL_INTERVAL)
     logger.info(
         "Metrics  : http://%s:%d%s",
@@ -420,20 +419,20 @@ def main() -> None:
         config.METRICS_PATH,
     )
 
+    # dalybms address: 4 = RS-485, 8 = UART/Bluetooth
+    bms_address = 8 if config.BMS_UART else 4
     bms = DalyBMS(
         port=config.SERIAL_PORT,
-        baud_rate=config.BAUD_RATE,
-        address=config.BMS_ADDRESS,
-        timeout=config.SERIAL_TIMEOUT,
+        address=bms_address,
     )
 
     try:
         bms.connect()
     except DalyBMSError as exc:
-        logger.error("Could not open serial port: %s", exc)
+        logger.error("Could not connect to BMS: %s", exc)
         logger.error(
             "Please check SERIAL_PORT in config.py / .env and verify that "
-            "the USB-to-RS485 adapter is connected."
+            "the serial adapter is connected."
         )
         sys.exit(1)
 

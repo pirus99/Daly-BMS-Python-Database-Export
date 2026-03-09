@@ -220,6 +220,17 @@ class DalyBMS:
     UART / Bluetooth.  This adapter accepts the legacy hex-style address
     ``0x40`` (64) and ``0x80`` (128) as well and converts them automatically:
     any ``address >= 16`` is right-shifted by 4 bits (e.g. ``0x40 → 4``).
+
+    Data-fetch toggles
+    ------------------
+    Some BMS firmware versions do not respond correctly to every command.
+    Each ``fetch_*`` constructor parameter controls whether that particular
+    command is issued during :meth:`get_all_data`.  All default to ``True``.
+
+    When *fetch_status* is ``False`` the library cannot auto-detect how many
+    cells / sensors the pack has.  Supply *cell_count_override* and
+    *temp_sensor_count_override* so that :meth:`get_all_data` can still
+    request per-cell voltages and per-sensor temperatures.
     """
 
     def __init__(
@@ -228,6 +239,17 @@ class DalyBMS:
         baud_rate: int = 9600,
         address: int = 0x40,
         timeout: float = 1.0,
+        fetch_soc: bool = True,
+        fetch_cell_voltage_range: bool = True,
+        fetch_temperature_range: bool = True,
+        fetch_mosfet_status: bool = True,
+        fetch_status: bool = True,
+        fetch_cell_voltages: bool = True,
+        fetch_temperatures: bool = True,
+        fetch_balancing: bool = True,
+        fetch_errors: bool = True,
+        cell_count_override: int = 0,
+        temp_sensor_count_override: int = 0,
     ) -> None:
         self.port = port
         # Convert legacy hex-style address (e.g. 0x40) to dalybms convention.
@@ -235,11 +257,25 @@ class DalyBMS:
         lib_address = address >> 4 if address >= 16 else address
         if lib_address not in (4, 8):
             logger.warning(
-                "Unexpected BMS address 0x%02X; defaulting to RS-485 (address=4).",
+                "Unexpected BMS address %r (resolved to lib address %d); "
+                "defaulting to RS-485 (lib address=4).",
                 address,
+                lib_address,
             )
             lib_address = 4
         self._lib = _DalyBMSLib(address=lib_address, logger=logger)
+
+        self._fetch_soc              = fetch_soc
+        self._fetch_cell_voltage_range = fetch_cell_voltage_range
+        self._fetch_temperature_range  = fetch_temperature_range
+        self._fetch_mosfet_status    = fetch_mosfet_status
+        self._fetch_status           = fetch_status
+        self._fetch_cell_voltages    = fetch_cell_voltages
+        self._fetch_temperatures     = fetch_temperatures
+        self._fetch_balancing        = fetch_balancing
+        self._fetch_errors           = fetch_errors
+        self._cell_count_override    = cell_count_override
+        self._temp_sensor_count_override = temp_sensor_count_override
 
     # ------------------------------------------------------------------
     # Connection management
@@ -276,114 +312,146 @@ class DalyBMS:
         """
         Query all standard BMS data and return a :class:`DalyBMSData` snapshot.
 
-        Each sub-command is attempted independently.  A failure in one command
-        does not abort the others – the corresponding field in the result is
-        left as *None* / an empty list and a warning is logged.
+        Only the commands whose corresponding ``fetch_*`` flag is ``True``
+        (set in the constructor) are issued.  Each sub-command is attempted
+        independently -- a failure in one does not abort the others.
         """
         data = DalyBMSData()
 
         # -- SOC / pack voltage / current ------------------------------------
-        try:
-            soc = self._lib.get_soc()
-            if soc:
-                data.basic = BasicStatus(
-                    pack_voltage=soc["total_voltage"],
-                    acquisition_voltage=0.0,
-                    pack_current=soc["current"],
-                    soc_percent=soc["soc_percent"],
-                )
-        except Exception as exc:
-            logger.warning("Failed to read SOC: %s", exc)
+        if self._fetch_soc:
+            try:
+                soc = self._lib.get_soc()
+                if soc:
+                    data.basic = BasicStatus(
+                        pack_voltage=soc["total_voltage"],
+                        # acquisition_voltage not provided by the dalybms library
+                        acquisition_voltage=0.0,
+                        pack_current=soc["current"],
+                        soc_percent=soc["soc_percent"],
+                    )
+            except Exception as exc:
+                logger.warning("Failed to read SOC: %s", exc)
 
         # -- Cell voltage extremes -------------------------------------------
-        try:
-            cvr = self._lib.get_cell_voltage_range()
-            if cvr:
-                data.cell_extremes = CellVoltageExtremes(
-                    max_voltage=cvr["highest_voltage"],
-                    max_cell_number=cvr["highest_cell"],
-                    min_voltage=cvr["lowest_voltage"],
-                    min_cell_number=cvr["lowest_cell"],
-                )
-        except Exception as exc:
-            logger.warning("Failed to read cell voltage range: %s", exc)
+        if self._fetch_cell_voltage_range:
+            try:
+                cvr = self._lib.get_cell_voltage_range()
+                if cvr:
+                    data.cell_extremes = CellVoltageExtremes(
+                        max_voltage=cvr["highest_voltage"],
+                        max_cell_number=cvr["highest_cell"],
+                        min_voltage=cvr["lowest_voltage"],
+                        min_cell_number=cvr["lowest_cell"],
+                    )
+            except Exception as exc:
+                logger.warning("Failed to read cell voltage range: %s", exc)
 
         # -- Temperature extremes --------------------------------------------
-        try:
-            tr = self._lib.get_temperature_range()
-            if tr:
-                data.temp_extremes = TemperatureExtremes(
-                    max_temperature=float(tr["highest_temperature"]),
-                    max_sensor_number=tr["highest_sensor"],
-                    min_temperature=float(tr["lowest_temperature"]),
-                    min_sensor_number=tr["lowest_sensor"],
-                )
-        except Exception as exc:
-            logger.warning("Failed to read temperature range: %s", exc)
+        if self._fetch_temperature_range:
+            try:
+                tr = self._lib.get_temperature_range()
+                if tr:
+                    data.temp_extremes = TemperatureExtremes(
+                        max_temperature=float(tr["highest_temperature"]),
+                        max_sensor_number=tr["highest_sensor"],
+                        min_temperature=float(tr["lowest_temperature"]),
+                        min_sensor_number=tr["lowest_sensor"],
+                    )
+            except Exception as exc:
+                logger.warning("Failed to read temperature range: %s", exc)
 
         # -- MOSFET status ---------------------------------------------------
-        try:
-            mos = self._lib.get_mosfet_status()
-            if mos:
-                data.mos = MosStatus(
-                    charge_mos_on=bool(mos["charging_mosfet"]),
-                    discharge_mos_on=bool(mos["discharging_mosfet"]),
-                    bms_heartbeat=0,
-                    remaining_capacity_ah=mos["capacity_ah"],
-                )
-        except Exception as exc:
-            logger.warning("Failed to read MOSFET status: %s", exc)
+        if self._fetch_mosfet_status:
+            try:
+                mos = self._lib.get_mosfet_status()
+                if mos:
+                    data.mos = MosStatus(
+                        charge_mos_on=bool(mos["charging_mosfet"]),
+                        discharge_mos_on=bool(mos["discharging_mosfet"]),
+                        # bms_heartbeat not provided by the dalybms library
+                        bms_heartbeat=0,
+                        remaining_capacity_ah=mos["capacity_ah"],
+                    )
+            except Exception as exc:
+                logger.warning("Failed to read MOSFET status: %s", exc)
 
         # -- BMS status (cell count, sensors, cycles) ------------------------
-        try:
-            st = self._lib.get_status()
-            if st:
-                data.status = StatusInfo(
-                    cell_count=st["cells"],
-                    temperature_sensor_count=st["temperature_sensors"],
-                    charger_connected=bool(st["charger_running"]),
-                    load_connected=bool(st["load_running"]),
-                    states=0,
-                    cycles=st["cycles"],
-                )
-        except Exception as exc:
-            logger.warning("Failed to read BMS status: %s", exc)
+        if self._fetch_status:
+            try:
+                st = self._lib.get_status()
+                if st:
+                    data.status = StatusInfo(
+                        cell_count=st["cells"],
+                        temperature_sensor_count=st["temperature_sensors"],
+                        charger_connected=bool(st["charger_running"]),
+                        load_connected=bool(st["load_running"]),
+                        # raw state bits not provided by the dalybms library
+                        states=0,
+                        cycles=st["cycles"],
+                    )
+            except Exception as exc:
+                logger.warning("Failed to read BMS status: %s", exc)
+        elif self._cell_count_override > 0 or self._temp_sensor_count_override > 0:
+            # Status fetch is disabled -- synthesise a minimal StatusInfo from
+            # the overrides so per-cell and per-sensor commands still work.
+            data.status = StatusInfo(
+                cell_count=self._cell_count_override,
+                temperature_sensor_count=self._temp_sensor_count_override,
+            )
+
+        # The dalybms library uses its internal self.status dict (populated by
+        # get_status()) to calculate how many response frames to expect for
+        # cell voltages and temperatures.  When FETCH_STATUS is False we prime
+        # that dict with the override counts so those commands keep working.
+        if not self._fetch_status and data.status:
+            if self._lib.status is None:
+                self._lib.status = {}
+            self._lib.status["cells"] = data.status.cell_count
+            self._lib.status["temperature_sensors"] = data.status.temperature_sensor_count
 
         # -- Per-cell voltages -----------------------------------------------
-        try:
-            cv = self._lib.get_cell_voltages()
-            if cv:
-                data.cell_voltages = [cv[k] for k in sorted(cv.keys())]
-        except Exception as exc:
-            logger.warning("Failed to read cell voltages: %s", exc)
+        if self._fetch_cell_voltages:
+            try:
+                cv = self._lib.get_cell_voltages()
+                if cv:
+                    data.cell_voltages = [cv[k] for k in sorted(cv.keys())]
+            except Exception as exc:
+                logger.warning("Failed to read cell voltages: %s", exc)
 
         # -- Per-sensor temperatures -----------------------------------------
-        try:
-            temps = self._lib.get_temperatures()
-            if temps:
-                data.temperatures = [temps[k] for k in sorted(temps.keys())]
-        except Exception as exc:
-            logger.warning("Failed to read temperatures: %s", exc)
+        if self._fetch_temperatures:
+            try:
+                temps = self._lib.get_temperatures()
+                if temps:
+                    data.temperatures = [temps[k] for k in sorted(temps.keys())]
+            except Exception as exc:
+                logger.warning("Failed to read temperatures: %s", exc)
 
         # -- Cell balancing status -------------------------------------------
-        try:
-            bal = self._lib.get_balancing_status()
-            if bal and "error" not in bal and data.status:
-                data.cell_balance_active = [
-                    bool(bal.get(i, False))
-                    for i in range(1, data.status.cell_count + 1)
-                ]
-            elif data.status:
-                data.cell_balance_active = [False] * data.status.cell_count
-        except Exception as exc:
-            logger.warning("Failed to read balancing status: %s", exc)
+        if self._fetch_balancing:
+            try:
+                bal = self._lib.get_balancing_status()
+                if bal and "error" not in bal and data.status:
+                    data.cell_balance_active = [
+                        bool(bal.get(i, False))
+                        for i in range(1, data.status.cell_count + 1)
+                    ]
+                elif data.status:
+                    data.cell_balance_active = [False] * data.status.cell_count
+            except Exception as exc:
+                logger.warning("Failed to read balancing status: %s", exc)
 
         # -- Failure / alarm flags -------------------------------------------
-        try:
-            raw_errors = self._lib._read_request("98")
-            if raw_errors is not False and raw_errors:
-                data.failures = _parse_failure_flags(raw_errors)
-        except Exception as exc:
-            logger.warning("Failed to read failure flags: %s", exc)
+        # NOTE: _read_request is a private dalybms method; it returns the
+        # raw 8-byte payload that get_errors() would receive.  We parse it
+        # directly to populate the structured FailureFlags dataclass.
+        if self._fetch_errors:
+            try:
+                raw_errors = self._lib._read_request("98")
+                if raw_errors is not False and raw_errors:
+                    data.failures = _parse_failure_flags(raw_errors)
+            except Exception as exc:
+                logger.warning("Failed to read failure flags: %s", exc)
 
         return data

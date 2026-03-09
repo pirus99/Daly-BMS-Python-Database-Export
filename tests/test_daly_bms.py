@@ -63,7 +63,9 @@ def _make_lib_mock(**kwargs):
     m.get_balancing_status.return_value = kwargs.get("balancing_status", {
         "error": "not implemented"
     })
-    # Raw failure bytes: all zeros (no alarms)
+    # Raw failure bytes: all zeros (no alarms).
+    # _read_request is a private method of dalybms.DalyBMS that returns the
+    # 8-byte payload from BMS command 0x98 (failure flags).
     m._read_request.return_value = bytes(8)
     return m
 
@@ -386,6 +388,135 @@ class TestParseFailureFlags(unittest.TestCase):
         flags = bms_mod._parse_failure_flags(data)
         self.assertFalse(flags.charge_mos_fault)
         self.assertTrue(flags.discharge_mos_fault)
+
+
+# ---------------------------------------------------------------------------
+# Tests for data-fetch toggles
+# ---------------------------------------------------------------------------
+
+class TestFetchToggles(unittest.TestCase):
+    """Verify that disabled fetch flags prevent the corresponding lib call."""
+
+    def _make_bms(self, **fetch_kwargs):
+        with patch("daly_bms._DalyBMSLib"):
+            bms = bms_mod.DalyBMS(port="/dev/null", address=4, **fetch_kwargs)
+        bms._lib = _make_lib_mock()
+        return bms
+
+    def test_fetch_soc_false_skips_call(self):
+        bms = self._make_bms(fetch_soc=False)
+        data = bms.get_all_data()
+        bms._lib.get_soc.assert_not_called()
+        self.assertIsNone(data.basic)
+
+    def test_fetch_cell_voltage_range_false_skips_call(self):
+        bms = self._make_bms(fetch_cell_voltage_range=False)
+        data = bms.get_all_data()
+        bms._lib.get_cell_voltage_range.assert_not_called()
+        self.assertIsNone(data.cell_extremes)
+
+    def test_fetch_temperature_range_false_skips_call(self):
+        bms = self._make_bms(fetch_temperature_range=False)
+        data = bms.get_all_data()
+        bms._lib.get_temperature_range.assert_not_called()
+        self.assertIsNone(data.temp_extremes)
+
+    def test_fetch_mosfet_status_false_skips_call(self):
+        bms = self._make_bms(fetch_mosfet_status=False)
+        data = bms.get_all_data()
+        bms._lib.get_mosfet_status.assert_not_called()
+        self.assertIsNone(data.mos)
+
+    def test_fetch_status_false_skips_call(self):
+        bms = self._make_bms(fetch_status=False)
+        data = bms.get_all_data()
+        bms._lib.get_status.assert_not_called()
+        # No override provided → status stays None
+        self.assertIsNone(data.status)
+
+    def test_fetch_cell_voltages_false_skips_call(self):
+        bms = self._make_bms(fetch_cell_voltages=False)
+        data = bms.get_all_data()
+        bms._lib.get_cell_voltages.assert_not_called()
+        self.assertEqual(data.cell_voltages, [])
+
+    def test_fetch_temperatures_false_skips_call(self):
+        bms = self._make_bms(fetch_temperatures=False)
+        data = bms.get_all_data()
+        bms._lib.get_temperatures.assert_not_called()
+        self.assertEqual(data.temperatures, [])
+
+    def test_fetch_balancing_false_skips_call(self):
+        bms = self._make_bms(fetch_balancing=False)
+        data = bms.get_all_data()
+        bms._lib.get_balancing_status.assert_not_called()
+        self.assertEqual(data.cell_balance_active, [])
+
+    def test_fetch_errors_false_skips_call(self):
+        bms = self._make_bms(fetch_errors=False)
+        data = bms.get_all_data()
+        bms._lib._read_request.assert_not_called()
+        self.assertIsNone(data.failures)
+
+
+class TestFetchStatusFalseWithOverride(unittest.TestCase):
+    """
+    Verify that cell voltages and temperatures still work when FETCH_STATUS
+    is False but cell_count_override / temp_sensor_count_override are set.
+    """
+
+    def _make_bms(self, cell_count=4, temp_count=2):
+        with patch("daly_bms._DalyBMSLib"):
+            bms = bms_mod.DalyBMS(
+                port="/dev/null",
+                address=4,
+                fetch_status=False,
+                cell_count_override=cell_count,
+                temp_sensor_count_override=temp_count,
+            )
+        bms._lib = _make_lib_mock()
+        return bms
+
+    def test_status_synthesised_from_override(self):
+        bms = self._make_bms(cell_count=8, temp_count=3)
+        data = bms.get_all_data()
+        bms._lib.get_status.assert_not_called()
+        self.assertIsNotNone(data.status)
+        self.assertEqual(data.status.cell_count, 8)
+        self.assertEqual(data.status.temperature_sensor_count, 3)
+
+    def test_lib_status_primed_for_cell_voltages(self):
+        bms = self._make_bms(cell_count=4, temp_count=2)
+        # Simulate the case where connect() failed to populate lib.status
+        bms._lib.status = None
+        bms.get_all_data()
+        # The adapter must prime lib.status so get_cell_voltages() works.
+        self.assertIsNotNone(bms._lib.status)
+        self.assertEqual(bms._lib.status["cells"], 4)
+        self.assertEqual(bms._lib.status["temperature_sensors"], 2)
+
+    def test_cell_voltages_still_fetched(self):
+        bms = self._make_bms(cell_count=4)
+        data = bms.get_all_data()
+        bms._lib.get_cell_voltages.assert_called_once()
+        self.assertEqual(len(data.cell_voltages), 4)
+
+    def test_no_override_skips_cell_voltages(self):
+        """Without an override, cell voltages and temperatures are not fetched."""
+        with patch("daly_bms._DalyBMSLib"):
+            bms = bms_mod.DalyBMS(
+                port="/dev/null",
+                address=4,
+                fetch_status=False,
+                cell_count_override=0,
+                temp_sensor_count_override=0,
+            )
+        bms._lib = _make_lib_mock()
+        # lib.status is not primed, so get_cell_voltages will fail inside
+        # dalybms (_calc_num_responses checks self.status).  Our adapter
+        # still calls it but handles any exception gracefully.
+        data = bms.get_all_data()
+        self.assertIsNone(data.status)
 
 
 if __name__ == "__main__":

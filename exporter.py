@@ -419,11 +419,38 @@ def main() -> None:
         config.METRICS_PATH,
     )
 
+    # Log which data categories are enabled / disabled.
+    fetch_map = {
+        "soc": config.FETCH_SOC,
+        "cell_voltage_range": config.FETCH_CELL_VOLTAGE_RANGE,
+        "temperature_range": config.FETCH_TEMPERATURE_RANGE,
+        "mosfet_status": config.FETCH_MOSFET_STATUS,
+        "status": config.FETCH_STATUS,
+        "cell_voltages": config.FETCH_CELL_VOLTAGES,
+        "temperatures": config.FETCH_TEMPERATURES,
+        "balancing": config.FETCH_BALANCING,
+        "errors": config.FETCH_ERRORS,
+    }
+    disabled = [k for k, v in fetch_map.items() if not v]
+    if disabled:
+        logger.info("Disabled data categories: %s", ", ".join(disabled))
+
     # dalybms address: 4 = RS-485, 8 = UART/Bluetooth
     bms_address = 8 if config.BMS_UART else 4
     bms = DalyBMS(
         port=config.SERIAL_PORT,
         address=bms_address,
+        fetch_soc=config.FETCH_SOC,
+        fetch_cell_voltage_range=config.FETCH_CELL_VOLTAGE_RANGE,
+        fetch_temperature_range=config.FETCH_TEMPERATURE_RANGE,
+        fetch_mosfet_status=config.FETCH_MOSFET_STATUS,
+        fetch_status=config.FETCH_STATUS,
+        fetch_cell_voltages=config.FETCH_CELL_VOLTAGES,
+        fetch_temperatures=config.FETCH_TEMPERATURES,
+        fetch_balancing=config.FETCH_BALANCING,
+        fetch_errors=config.FETCH_ERRORS,
+        cell_count_override=config.BMS_CELL_COUNT,
+        temp_sensor_count_override=config.BMS_TEMP_SENSOR_COUNT,
     )
 
     try:

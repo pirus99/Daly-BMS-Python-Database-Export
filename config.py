@@ -20,6 +20,14 @@ except ImportError:
     pass  # python-dotenv is listed in requirements.txt; this is a safety net
 
 
+def _bool(name: str, default: bool) -> bool:
+    """Read a boolean environment variable (true/1/yes = True, empty = default)."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    return raw.lower() in ("1", "true", "yes")
+
+
 # ---------------------------------------------------------------------------
 # Serial / RS-485 interface settings
 # ---------------------------------------------------------------------------
@@ -32,7 +40,7 @@ SERIAL_PORT: str = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")
 
 # Set to "true" to communicate via UART instead of RS-485.
 # This changes the dalybms library address from 4 (RS-485) to 8 (UART/Bluetooth).
-BMS_UART: bool = os.environ.get("BMS_UART", "false").lower() in ("1", "true", "yes")
+BMS_UART: bool = _bool("BMS_UART", False)
 
 # ---------------------------------------------------------------------------
 # Daly BMS device settings
@@ -44,6 +52,34 @@ BMS_MODEL: str = os.environ.get("BMS_MODEL", "Daly BMS")
 
 # An optional instance identifier for setups with more than one BMS.
 BMS_INSTANCE: str = os.environ.get("BMS_INSTANCE", "bms0")
+
+# ---------------------------------------------------------------------------
+# Data-fetch toggles
+#
+# Some BMS firmware versions do not respond correctly to every command.
+# Set any of the flags below to "false" to skip that command entirely.
+#
+# Note: FETCH_CELL_VOLTAGES and FETCH_TEMPERATURES depend on knowing the
+# number of cells/sensors.  When FETCH_STATUS is disabled you must supply
+# BMS_CELL_COUNT and BMS_TEMP_SENSOR_COUNT so the correct number of frames
+# is requested.
+# ---------------------------------------------------------------------------
+
+FETCH_SOC: bool                 = _bool("FETCH_SOC", True)
+FETCH_CELL_VOLTAGE_RANGE: bool  = _bool("FETCH_CELL_VOLTAGE_RANGE", True)
+FETCH_TEMPERATURE_RANGE: bool   = _bool("FETCH_TEMPERATURE_RANGE", True)
+FETCH_MOSFET_STATUS: bool       = _bool("FETCH_MOSFET_STATUS", True)
+FETCH_STATUS: bool              = _bool("FETCH_STATUS", True)
+FETCH_CELL_VOLTAGES: bool       = _bool("FETCH_CELL_VOLTAGES", True)
+FETCH_TEMPERATURES: bool        = _bool("FETCH_TEMPERATURES", True)
+FETCH_BALANCING: bool           = _bool("FETCH_BALANCING", True)
+FETCH_ERRORS: bool              = _bool("FETCH_ERRORS", True)
+
+# Fallback cell / sensor counts used when FETCH_STATUS is false.
+# Set these to the actual values for your pack so that FETCH_CELL_VOLTAGES
+# and FETCH_TEMPERATURES still work.  0 means "skip those commands too".
+BMS_CELL_COUNT: int        = int(os.environ.get("BMS_CELL_COUNT", "0"))
+BMS_TEMP_SENSOR_COUNT: int = int(os.environ.get("BMS_TEMP_SENSOR_COUNT", "0"))
 
 
 # ---------------------------------------------------------------------------

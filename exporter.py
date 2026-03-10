@@ -27,17 +27,27 @@ from prometheus_client import (
 )
 
 import config
-from daly_bms import DalyBMS, DalyBMSData, DalyBMSError
+from daly_bms import DalyBMS, DalyBMSData, DalyBMSError, _LIB_LOGGER_NAME
 
 # ---------------------------------------------------------------------------
 # Logging
+#
+# Root logger is set to DEBUG so that child loggers (notably the dalybms
+# library when BMS_VERBOSE is on) can generate records.  Output is gated by
+# the *handler* level:
+#   - default : INFO  (prevents debug-frame spam in production)
+#   - BMS_DEBUG_LOG=true → lowered to DEBUG in main() so debug output appears
 # ---------------------------------------------------------------------------
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
+# Default gate: only INFO+ printed until BMS_DEBUG_LOG lowers it.
+for _h in logging.getLogger().handlers:
+    if _h.level == logging.NOTSET:
+        _h.setLevel(logging.INFO)
 logger = logging.getLogger("daly_bms_exporter")
 
 
@@ -58,7 +68,7 @@ bms_info.info(
         "model": config.BMS_MODEL,
         "instance": config.BMS_INSTANCE,
         "serial_port": config.SERIAL_PORT,
-        "bms_address": hex(config.BMS_ADDRESS),
+        "connection_mode": "uart" if config.BMS_UART else "rs485",
     }
 )
 
@@ -318,32 +328,73 @@ def _update_metrics(data: DalyBMSData) -> None:
 # ---------------------------------------------------------------------------
 
 class BMSPoller(threading.Thread):
-    """Daemon thread that polls the BMS every :attr:`interval` seconds."""
+    """
+    Daemon thread that polls the BMS every :attr:`interval` seconds.
 
-    def __init__(self, bms: DalyBMS, interval: float) -> None:
+    Each poll runs in a short-lived worker thread.  If the worker has not
+    finished within *poll_timeout* seconds the serial port is closed to
+    unblock any pending read, a warning is logged, and the poller moves on to
+    the next interval.  This ensures no two polls ever run concurrently.
+    """
+
+    def __init__(self, bms: DalyBMS, interval: float, poll_timeout: float) -> None:
         super().__init__(name="bms-poller", daemon=True)
         self._bms = bms
         self._interval = interval
+        self._poll_timeout = poll_timeout
         self._consecutive_errors = 0
 
     def run(self) -> None:
         logger.info(
-            "BMS poller started — polling every %.1f s", self._interval
+            "BMS poller started — interval=%.1f s, timeout=%.1f s",
+            self._interval,
+            self._poll_timeout,
         )
         while True:
             start = time.monotonic()
-            try:
-                data = self._bms.get_all_data()
-                _update_metrics(data)
-                self._consecutive_errors = 0
-                bms_up.labels(*_LABEL_VALUES).set(1)
-                elapsed = time.monotonic() - start
-                scrape_duration.labels(*_LABEL_VALUES).set(elapsed)
-                logger.debug("Polled BMS in %.3f s", elapsed)
-            except DalyBMSError as exc:
+
+            # Run the actual BMS communication in a short-lived daemon thread
+            # so we can apply a hard timeout without blocking the poller loop.
+            poll_result: dict = {}
+
+            def _poll() -> None:
+                try:
+                    poll_result["data"] = self._bms.get_all_data()
+                except Exception as exc:  # noqa: BLE001
+                    poll_result["error"] = exc
+
+            worker = threading.Thread(target=_poll, daemon=True, name="bms-poll-worker")
+            worker.start()
+            worker.join(timeout=self._poll_timeout)
+            elapsed = time.monotonic() - start
+
+            if worker.is_alive():
+                # The poll thread is still blocked (likely on a serial read).
                 self._consecutive_errors += 1
                 scrape_errors_total.labels(*_LABEL_VALUES).inc()
-                elapsed = time.monotonic() - start
+                scrape_duration.labels(*_LABEL_VALUES).set(elapsed)
+                bms_up.labels(*_LABEL_VALUES).set(0)
+                logger.warning(
+                    "BMS poll timed out after %.1f s (timeout=%.1f s); "
+                    "closing serial port to interrupt the hung request.",
+                    elapsed,
+                    self._poll_timeout,
+                )
+                # Close the serial port so the worker's pending read raises
+                # a SerialException and the thread can exit cleanly.
+                try:
+                    self._bms.disconnect()
+                except Exception:
+                    pass
+                # Give the worker a moment to exit; proceed regardless.
+                worker.join(timeout=1.0)
+                if worker.is_alive():
+                    logger.warning("Poll worker did not exit after disconnect; proceeding.")
+
+            elif "error" in poll_result:
+                exc = poll_result["error"]
+                self._consecutive_errors += 1
+                scrape_errors_total.labels(*_LABEL_VALUES).inc()
                 scrape_duration.labels(*_LABEL_VALUES).set(elapsed)
                 if self._consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
                     bms_up.labels(*_LABEL_VALUES).set(0)
@@ -354,13 +405,20 @@ class BMSPoller(threading.Thread):
                     )
                 else:
                     logger.warning("BMS poll error (%d): %s", self._consecutive_errors, exc)
-            except Exception as exc:  # pylint: disable=broad-except
-                self._consecutive_errors += 1
-                scrape_errors_total.labels(*_LABEL_VALUES).inc()
-                bms_up.labels(*_LABEL_VALUES).set(0)
-                logger.exception("Unexpected error in BMS poller: %s", exc)
 
-            time.sleep(self._interval)
+            elif "data" in poll_result:
+                data = poll_result["data"]
+                if data is not None:
+                    _update_metrics(data)
+                    self._consecutive_errors = 0
+                    bms_up.labels(*_LABEL_VALUES).set(1)
+                    scrape_duration.labels(*_LABEL_VALUES).set(elapsed)
+                    logger.debug("Polled BMS in %.3f s", elapsed)
+
+            # Sleep for whatever remains of the poll interval.
+            sleep_time = max(0.0, self._interval - elapsed)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
 
 # ---------------------------------------------------------------------------
@@ -407,33 +465,84 @@ class MetricsHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # BMS_DEBUG_LOG: lower the root handler level to DEBUG so debug output
+    # (including dalybms verbose frames when BMS_VERBOSE is also true) appears
+    # in the console / logfiles.  Without this flag only INFO+ is printed.
+    if config.BMS_DEBUG_LOG:
+        for h in logging.getLogger().handlers:
+            h.setLevel(logging.DEBUG)
+
     logger.info("=== Daly BMS Prometheus Exporter ===")
-    logger.info("Model    : %s", config.BMS_MODEL)
-    logger.info("Instance : %s", config.BMS_INSTANCE)
-    logger.info("Port     : %s @ %d baud", config.SERIAL_PORT, config.BAUD_RATE)
-    logger.info("BMS addr : 0x%02X", config.BMS_ADDRESS)
-    logger.info("Poll     : %.1f s", config.POLL_INTERVAL)
+    logger.info("Model      : %s", config.BMS_MODEL)
+    logger.info("Instance   : %s", config.BMS_INSTANCE)
     logger.info(
-        "Metrics  : http://%s:%d%s",
+        "Port       : %s (%s%s)",
+        config.SERIAL_PORT,
+        "UART" if config.BMS_UART else "RS-485",
+        ", Sinowealth" if config.BMS_SINOWEALTH else "",
+    )
+    logger.info("Poll       : %.1f s (timeout: %.1f s)", config.POLL_INTERVAL, config.POLL_TIMEOUT)
+    logger.info(
+        "BMS_VERBOSE: %s  BMS_DEBUG_LOG: %s",
+        "on" if config.BMS_VERBOSE else "off",
+        "on" if config.BMS_DEBUG_LOG else "off",
+    )
+    logger.info(
+        "Metrics    : http://%s:%d%s",
         config.WEB_SERVER_ADDRESS,
         config.WEB_SERVER_PORT,
         config.METRICS_PATH,
     )
 
+    if config.BMS_VERBOSE and not config.BMS_DEBUG_LOG:
+        logger.info(
+            "BMS_VERBOSE is on (--status timing workaround active); "
+            "set BMS_DEBUG_LOG=true to see the raw serial frames."
+        )
+
+    # Log which data categories are enabled / disabled.
+    fetch_map = {
+        "soc": config.FETCH_SOC,
+        "cell_voltage_range": config.FETCH_CELL_VOLTAGE_RANGE,
+        "temperature_range": config.FETCH_TEMPERATURE_RANGE,
+        "mosfet_status": config.FETCH_MOSFET_STATUS,
+        "status": config.FETCH_STATUS,
+        "cell_voltages": config.FETCH_CELL_VOLTAGES,
+        "temperatures": config.FETCH_TEMPERATURES,
+        "balancing": config.FETCH_BALANCING,
+        "errors": config.FETCH_ERRORS,
+    }
+    disabled = [k for k, v in fetch_map.items() if not v]
+    if disabled:
+        logger.info("Disabled data categories: %s", ", ".join(disabled))
+
+    # dalybms address: 4 = RS-485, 8 = UART/Bluetooth (ignored for Sinowealth)
+    bms_address = 8 if config.BMS_UART else 4
     bms = DalyBMS(
         port=config.SERIAL_PORT,
-        baud_rate=config.BAUD_RATE,
-        address=config.BMS_ADDRESS,
-        timeout=config.SERIAL_TIMEOUT,
+        address=bms_address,
+        sinowealth=config.BMS_SINOWEALTH,
+        verbose=config.BMS_VERBOSE,
+        fetch_soc=config.FETCH_SOC,
+        fetch_cell_voltage_range=config.FETCH_CELL_VOLTAGE_RANGE,
+        fetch_temperature_range=config.FETCH_TEMPERATURE_RANGE,
+        fetch_mosfet_status=config.FETCH_MOSFET_STATUS,
+        fetch_status=config.FETCH_STATUS,
+        fetch_cell_voltages=config.FETCH_CELL_VOLTAGES,
+        fetch_temperatures=config.FETCH_TEMPERATURES,
+        fetch_balancing=config.FETCH_BALANCING,
+        fetch_errors=config.FETCH_ERRORS,
+        cell_count_override=config.BMS_CELL_COUNT,
+        temp_sensor_count_override=config.BMS_TEMP_SENSOR_COUNT,
     )
 
     try:
         bms.connect()
     except DalyBMSError as exc:
-        logger.error("Could not open serial port: %s", exc)
+        logger.error("Could not connect to BMS: %s", exc)
         logger.error(
             "Please check SERIAL_PORT in config.py / .env and verify that "
-            "the USB-to-RS485 adapter is connected."
+            "the serial adapter is connected."
         )
         sys.exit(1)
 
@@ -441,7 +550,7 @@ def main() -> None:
     bms_up.labels(*_LABEL_VALUES).set(0)
 
     # Start background poller.
-    poller = BMSPoller(bms, interval=config.POLL_INTERVAL)
+    poller = BMSPoller(bms, interval=config.POLL_INTERVAL, poll_timeout=config.POLL_TIMEOUT)
     poller.start()
 
     # Start HTTP server (blocks until Ctrl-C).

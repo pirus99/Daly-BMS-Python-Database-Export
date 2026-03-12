@@ -343,6 +343,7 @@ class BMSPoller(threading.Thread):
         self._interval = interval
         self._poll_timeout = poll_timeout
         self._consecutive_errors = 0
+        self._needs_reconnect = False
 
     def run(self) -> None:
         logger.info(
@@ -359,6 +360,9 @@ class BMSPoller(threading.Thread):
 
             def _poll() -> None:
                 try:
+                    if self._needs_reconnect:
+                        self._bms.connect()
+                        self._needs_reconnect = False
                     poll_result["data"] = self._bms.get_all_data()
                 except Exception as exc:  # noqa: BLE001
                     poll_result["error"] = exc
@@ -390,12 +394,18 @@ class BMSPoller(threading.Thread):
                 worker.join(timeout=1.0)
                 if worker.is_alive():
                     logger.warning("Poll worker did not exit after disconnect; proceeding.")
+                # Reconnect on the next poll so communication can resume.
+                self._needs_reconnect = True
 
             elif "error" in poll_result:
                 exc = poll_result["error"]
                 self._consecutive_errors += 1
                 scrape_errors_total.labels(*_LABEL_VALUES).inc()
                 scrape_duration.labels(*_LABEL_VALUES).set(elapsed)
+                # Schedule a reconnect for the next poll; this restores the
+                # serial connection after a timeout-triggered disconnect or any
+                # other communication failure (e.g. USB hot-unplug).
+                self._needs_reconnect = True
                 if self._consecutive_errors >= config.MAX_CONSECUTIVE_ERRORS:
                     bms_up.labels(*_LABEL_VALUES).set(0)
                     logger.error(

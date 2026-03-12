@@ -699,7 +699,165 @@ class TestVerboseMode(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests for the poll-timeout watchdog (BMSPoller)
+# Tests for get_all_data raising DalyBMSError when all commands fail
+# ---------------------------------------------------------------------------
+
+class TestGetAllDataAllCommandsFail(unittest.TestCase):
+    """
+    Verify that get_all_data() raises DalyBMSError when every attempted
+    command raises an exception (e.g. serial port closed after a timeout).
+    """
+
+    def _bms_with_all_failing(self):
+        """Return a DalyBMS whose underlying lib raises on every method."""
+        with patch("daly_bms._DalyBMSLib"):
+            bms = bms_mod.DalyBMS(port="/dev/null", address=4)
+        # Make every library call raise a generic serial error
+        bms._lib.get_soc.side_effect = IOError("port not open")
+        bms._lib.get_cell_voltage_range.side_effect = IOError("port not open")
+        bms._lib.get_temperature_range.side_effect = IOError("port not open")
+        bms._lib.get_mosfet_status.side_effect = IOError("port not open")
+        bms._lib.get_status.side_effect = IOError("port not open")
+        bms._lib.get_cell_voltages.side_effect = IOError("port not open")
+        bms._lib.get_temperatures.side_effect = IOError("port not open")
+        bms._lib.get_balancing_status.side_effect = IOError("port not open")
+        bms._lib._read_request.side_effect = IOError("port not open")
+        return bms
+
+    def test_raises_daly_bms_error_when_all_commands_fail(self):
+        """All commands failing must raise DalyBMSError, not silently return."""
+        bms = self._bms_with_all_failing()
+        with self.assertRaises(bms_mod.DalyBMSError):
+            bms.get_all_data()
+
+    def test_partial_failure_does_not_raise(self):
+        """A single failing command must NOT raise – partial data is acceptable."""
+        with patch("daly_bms._DalyBMSLib"):
+            bms = bms_mod.DalyBMS(port="/dev/null", address=4)
+        bms._lib = _make_lib_mock()
+        # Only SOC fails; all other commands succeed
+        bms._lib.get_soc.side_effect = IOError("timeout")
+        data = bms.get_all_data()   # Must not raise
+        self.assertIsNone(data.basic)
+        self.assertIsNotNone(data.cell_extremes)
+
+    def test_no_fetches_enabled_does_not_raise(self):
+        """When all fetch flags are disabled (n_attempted == 0), no error is raised."""
+        with patch("daly_bms._DalyBMSLib"):
+            bms = bms_mod.DalyBMS(
+                port="/dev/null", address=4,
+                fetch_soc=False, fetch_cell_voltage_range=False,
+                fetch_temperature_range=False, fetch_mosfet_status=False,
+                fetch_status=False, fetch_cell_voltages=False,
+                fetch_temperatures=False, fetch_balancing=False,
+                fetch_errors=False,
+            )
+        bms._lib = _make_lib_mock()
+        data = bms.get_all_data()   # Must not raise
+        self.assertIsNone(data.basic)
+
+
+# ---------------------------------------------------------------------------
+# Tests for BMSPoller reconnection after timeout / error
+# ---------------------------------------------------------------------------
+
+class TestBMSPollerReconnect(unittest.TestCase):
+    """Verify that BMSPoller reconnects after a poll timeout or error."""
+
+    def setUp(self):
+        import sys
+        sys.modules.setdefault("prometheus_client", MagicMock())
+        import exporter as exp_mod
+        self.exp_mod = exp_mod
+
+    def _make_poller(self, bms_mock, interval=1.0, poll_timeout=0.1):
+        return self.exp_mod.BMSPoller(bms_mock, interval=interval, poll_timeout=poll_timeout)
+
+    def test_reconnect_called_after_poll_timeout(self):
+        """
+        After a poll timeout (which calls disconnect), the next poll must
+        call connect() before get_all_data().
+        """
+        import threading
+        import time
+
+        bms_mock = MagicMock()
+        # First get_all_data call blocks (simulates a hang).
+        hang_event = threading.Event()
+        call_order = []
+
+        first_call = True
+
+        def _get_all_data():
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                hang_event.wait(timeout=1.0)
+                raise RuntimeError("simulated serial close")
+            call_order.append("get_all_data")
+            return MagicMock()
+
+        def _connect():
+            call_order.append("connect")
+
+        bms_mock.get_all_data.side_effect = _get_all_data
+        bms_mock.connect.side_effect = _connect
+
+        poller = self._make_poller(bms_mock, interval=0.5, poll_timeout=0.15)
+        poller.start()
+
+        # Wait for the timeout to fire and disconnect to be called
+        time.sleep(0.5)
+        hang_event.set()   # unblock the stuck worker
+
+        # Wait for at least one more poll cycle
+        time.sleep(0.8)
+        poller.join(timeout=1.5)
+
+        # connect() must have been called to re-establish the connection
+        bms_mock.connect.assert_called()
+
+    def test_reconnect_called_after_get_all_data_error(self):
+        """
+        After get_all_data() raises (all commands failed), the next poll
+        must call connect() before polling again.
+        """
+        import threading
+        import time
+
+        bms_mock = MagicMock()
+        call_order = []
+        first_call = True
+
+        def _get_all_data():
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                raise bms_mod.DalyBMSError("all commands failed")
+            call_order.append("get_all_data")
+            return MagicMock()
+
+        def _connect():
+            call_order.append("connect")
+
+        bms_mock.get_all_data.side_effect = _get_all_data
+        bms_mock.connect.side_effect = _connect
+
+        poller = self._make_poller(bms_mock, interval=0.5, poll_timeout=1.0)
+        poller.start()
+
+        # Wait for two poll cycles: first fails, second should reconnect
+        time.sleep(1.2)
+        poller.join(timeout=1.5)
+
+        # connect() must have been called at least once for the reconnect
+        bms_mock.connect.assert_called()
+        # After reconnect, get_all_data should have been called again
+        self.assertIn("get_all_data", call_order)
+
+
+# ---------------------------------------------------------------------------
+# Tests for poll-timeout watchdog (BMSPoller)
 # ---------------------------------------------------------------------------
 
 class TestBMSPollerTimeout(unittest.TestCase):

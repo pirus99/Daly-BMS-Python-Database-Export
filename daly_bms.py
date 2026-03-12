@@ -358,11 +358,19 @@ class DalyBMS:
         Only the commands whose corresponding ``fetch_*`` flag is ``True``
         (set in the constructor) are issued.  Each sub-command is attempted
         independently -- a failure in one does not abort the others.
+
+        Raises :class:`DalyBMSError` if every attempted command raised an
+        exception, which typically indicates that the serial port has been
+        closed or the BMS is unresponsive.  This lets the caller (e.g.
+        :class:`exporter.BMSPoller`) detect a dead connection and reconnect.
         """
         data = DalyBMSData()
+        n_attempted: int = 0
+        n_exceptions: int = 0
 
         # -- SOC / pack voltage / current ------------------------------------
         if self._fetch_soc:
+            n_attempted += 1
             try:
                 soc = self._lib.get_soc()
                 if soc:
@@ -374,10 +382,12 @@ class DalyBMS:
                         soc_percent=soc["soc_percent"],
                     )
             except Exception as exc:
+                n_exceptions += 1
                 logger.warning("Failed to read SOC: %s", exc)
 
         # -- Cell voltage extremes -------------------------------------------
         if self._fetch_cell_voltage_range:
+            n_attempted += 1
             try:
                 cvr = self._lib.get_cell_voltage_range()
                 if cvr:
@@ -388,10 +398,12 @@ class DalyBMS:
                         min_cell_number=cvr["lowest_cell"],
                     )
             except Exception as exc:
+                n_exceptions += 1
                 logger.warning("Failed to read cell voltage range: %s", exc)
 
         # -- Temperature extremes --------------------------------------------
         if self._fetch_temperature_range:
+            n_attempted += 1
             try:
                 tr = self._lib.get_temperature_range()
                 if tr:
@@ -402,10 +414,12 @@ class DalyBMS:
                         min_sensor_number=tr["lowest_sensor"],
                     )
             except Exception as exc:
+                n_exceptions += 1
                 logger.warning("Failed to read temperature range: %s", exc)
 
         # -- MOSFET status ---------------------------------------------------
         if self._fetch_mosfet_status:
+            n_attempted += 1
             try:
                 mos = self._lib.get_mosfet_status()
                 if mos:
@@ -429,10 +443,12 @@ class DalyBMS:
                             remaining_capacity_ah=mos["capacity_ah"],
                         )
             except Exception as exc:
+                n_exceptions += 1
                 logger.warning("Failed to read MOSFET status: %s", exc)
 
         # -- BMS status (cell count, sensors, cycles) ------------------------
         if self._fetch_status:
+            n_attempted += 1
             try:
                 st = self._lib.get_status()
                 if st:
@@ -458,6 +474,7 @@ class DalyBMS:
                             cycles=st["cycles"],
                         )
             except Exception as exc:
+                n_exceptions += 1
                 logger.warning("Failed to read BMS status: %s", exc)
         elif self._cell_count_override > 0 or self._temp_sensor_count_override > 0:
             # Status fetch is disabled -- synthesise a minimal StatusInfo from
@@ -480,15 +497,18 @@ class DalyBMS:
 
         # -- Per-cell voltages -----------------------------------------------
         if self._fetch_cell_voltages:
+            n_attempted += 1
             try:
                 cv = self._lib.get_cell_voltages()
                 if cv:
                     data.cell_voltages = [cv[k] for k in sorted(cv.keys())]
             except Exception as exc:
+                n_exceptions += 1
                 logger.warning("Failed to read cell voltages: %s", exc)
 
         # -- Per-sensor temperatures -----------------------------------------
         if self._fetch_temperatures:
+            n_attempted += 1
             try:
                 temps = self._lib.get_temperatures()
                 if temps:
@@ -497,6 +517,7 @@ class DalyBMS:
                     # for Sinowealth) — sorted() works correctly for both.
                     data.temperatures = [temps[k] for k in sorted(temps.keys())]
             except Exception as exc:
+                n_exceptions += 1
                 logger.warning("Failed to read temperatures: %s", exc)
 
         # Back-fill Sinowealth status cell/sensor counts from actual data.
@@ -506,6 +527,7 @@ class DalyBMS:
 
         # -- Cell balancing status -------------------------------------------
         if self._fetch_balancing:
+            n_attempted += 1
             try:
                 bal = self._lib.get_balancing_status()
                 if bal and "error" not in bal and data.status:
@@ -516,10 +538,12 @@ class DalyBMS:
                 elif data.status:
                     data.cell_balance_active = [False] * data.status.cell_count
             except Exception as exc:
+                n_exceptions += 1
                 logger.warning("Failed to read balancing status: %s", exc)
 
         # -- Failure / alarm flags -------------------------------------------
         if self._fetch_errors:
+            n_attempted += 1
             try:
                 if self._sinowealth:
                     # Sinowealth returns a list of human-readable error strings;
@@ -535,6 +559,13 @@ class DalyBMS:
                     if raw_errors is not False and raw_errors:
                         data.failures = _parse_failure_flags(raw_errors)
             except Exception as exc:
+                n_exceptions += 1
                 logger.warning("Failed to read failure flags: %s", exc)
+
+        if n_attempted > 0 and n_exceptions == n_attempted:
+            raise DalyBMSError(
+                "Every BMS command raised an exception; the serial port may "
+                "be closed or the BMS unresponsive."
+            )
 
         return data
